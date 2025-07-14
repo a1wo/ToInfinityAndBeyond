@@ -194,6 +194,73 @@ def gen_one_img_2(
     return ret, idx_Bld_list, img, list_summed_codes
 
 
+def gen_one_img_3(
+    infinity_test, 
+    vae, 
+    text_tokenizer,
+    text_encoder,
+    prompt, 
+    cfg_list=[],
+    tau_list=[],
+    negative_prompt='',
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,
+    vae_type=0,
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,
+    gt_ls_Bl=None,
+    g_seed=None,
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+    edit = False,
+    edit_prompt=None,  # if None, no editing 
+    edit__si=0,  # if edit_prompt is None, this is ignored
+    edit__idx_Bld_list=None,
+):
+    sstt = time.time()
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+    if negative_prompt:
+        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+    else:
+        negative_label_B_or_BLT = None
+    
+    if edit:
+        edit__label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, edit_prompt)
+    else:
+        edit__label_B_or_BLT = None
+
+    print(f'cfg: {cfg_list}, tau: {tau_list}')
+    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+        stt = time.time()
+        ret, idx_Bld_list, img_list, list_summed_codes = infinity_test.autoregressive_infer_cfg_3(
+            vae=vae,
+            scale_schedule=scale_schedule,
+            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
+            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
+            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
+            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
+            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
+            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
+            ret_img=True, trunk_scale=1000,
+            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
+            sampling_per_bits=sampling_per_bits,
+            edit = edit, edit__label_B_or_BLT = edit__label_B_or_BLT, edit__si = edit__si,
+            edit__idx_Bld_list = edit__idx_Bld_list,
+        )
+    print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
+    img = img_list[0]
+    return ret, idx_Bld_list, img, list_summed_codes
+
+
 
 def get_prompt_id(prompt):
     md5 = hashlib.md5()
