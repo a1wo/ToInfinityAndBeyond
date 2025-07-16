@@ -241,7 +241,7 @@ def gen_one_img_3(
     print(f'cfg: {cfg_list}, tau: {tau_list}')
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
         stt = time.time()
-        ret, idx_Bld_list, img_list, list_summed_codes = infinity_test.autoregressive_infer_cfg_3(
+        ret, idx_Bld_list, img_list = infinity_test.autoregressive_infer_cfg(
             vae=vae,
             scale_schedule=scale_schedule,
             label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
@@ -253,12 +253,10 @@ def gen_one_img_3(
             ret_img=True, trunk_scale=1000,
             gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
             sampling_per_bits=sampling_per_bits,
-            edit = edit, edit__label_B_or_BLT = edit__label_B_or_BLT, edit__si = edit__si,
-            edit__idx_Bld_list = edit__idx_Bld_list,
         )
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
-    return ret, idx_Bld_list, img, list_summed_codes
+    return ret, idx_Bld_list, img
 
 
 

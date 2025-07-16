@@ -264,6 +264,7 @@ class SelfAttention(nn.Module):
                     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]]]
                     where 0 means visible and - means invisible (-inf)
                 else:
@@ -400,6 +401,92 @@ class CrossAttention(nn.Module):
         
         return self.proj_drop(self.proj(oup))
     
+    def forward_with_weights(self, q, ca_kv):
+        """
+        :param q: shaped as (batch, seq_len, Q_dim)
+        :param ca_kv: contains several vectors, each of which is shaped as (len_i, KV_dim). We have [len_1xKV_dim, len_2xKV_dim, len_3xKV_dim, ...] and lens == [len_1, len_2, len_3, ...]
+            - kv_compact: shaped as (sum(lens), KV_dim)
+            - cu_seqlens_k: cumulated sum of lens
+            - max_seqlen_k: int, max(lens)
+        :param return_attention_weights: if True, return attention weights for visualization
+        NOTE: seq_len (num of Qs) can reach 10k;  but len_i (num of KVs) must <= 256
+        
+        :return: shaped as (batch, seq_len, Q_dim), optionally attention weights
+        """
+        kv_compact, cu_seqlens_k, max_seqlen_k = ca_kv
+        N = kv_compact.shape[0]
+        
+        # Process K, V from text tokens
+        kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, bias=torch.cat((self.zero_k_bias, self.v_bias))).view(N, 2, self.num_heads, self.head_dim) # NC => N2Hc
+        k_compact, v_compact = kv_compact.unbind(dim=1)  # Each: (N, num_heads, head_dim)
+        
+        # Process Q from image tokens
+        if not self.for_attn_pool:
+            B, Lq = q.shape[:2]
+            q_compact = self.mat_q(q).view(-1, self.num_heads, self.head_dim)  # (B*Lq, num_heads, head_dim)
+        else:
+            B = cu_seqlens_k.shape[0] - 1
+            Lq = 1
+            q_compact = self.mat_q.repeat(B, 1, 1).to(dtype=kv_compact.dtype)
+        
+        if self.cos_attn:   # always False
+            scale_mul = self.scale_mul_1H1.clamp_max(self.max_scale_mul).exp()
+            q_compact = F.normalize(q_compact, dim=-1).mul(scale_mul)
+            k_compact = F.normalize(k_compact, dim=-1)
+        
+        # Manual attention computation to extract weights
+        attention_weights = []
+        outputs = []
+        
+        for batch_idx in range(B):
+            # Get text tokens (K, V) for this batch
+            start_idx = cu_seqlens_k[batch_idx]
+            end_idx = cu_seqlens_k[batch_idx + 1]
+            seq_len_k = end_idx - start_idx
+            
+            k_batch = k_compact[start_idx:end_idx]  # (seq_len_k, num_heads, head_dim)
+            v_batch = v_compact[start_idx:end_idx]  # (seq_len_k, num_heads, head_dim)
+            
+            # Get image tokens (Q) for this batch
+            q_batch = q_compact[batch_idx * Lq:(batch_idx + 1) * Lq]  # (Lq, num_heads, head_dim)
+            
+            # Compute attention scores: Q @ K^T
+            # q_batch: (Lq, num_heads, head_dim)
+            # k_batch: (seq_len_k, num_heads, head_dim)
+            attn_scores = torch.einsum('qhd,khd->qhk', q_batch, k_batch)  # (Lq, num_heads, seq_len_k)
+            attn_scores = attn_scores * self.scale
+            
+            # Apply softmax to get attention weights
+            attn_weights = F.softmax(attn_scores, dim=-1)  # (Lq, num_heads, seq_len_k)
+            
+            # Store attention weights for this batch
+            attention_weights.append({
+                'weights': attn_weights,  # (Lq, num_heads, seq_len_k)
+                'seq_len_k': seq_len_k,
+                'batch_idx': batch_idx
+            })
+            
+            # Apply attention to values: Attention @ V
+            output = torch.einsum('qhk,khd->qhd', attn_weights, v_batch)  # (Lq, num_heads, head_dim)
+            outputs.append(output)
+        
+        # Concatenate outputs from all batches
+        oup = torch.cat(outputs, dim=0).view(B, Lq, -1)  # (B, Lq, embed_dim)
+        
+        # Apply output projection
+        oup = self.proj_drop(self.proj(oup))
+        
+        # Save attention weights to a folder with a serial index
+        save_dir = "cache" + "/" + "attention_weights"
+        os.makedirs(save_dir, exist_ok=True)
+        existing = [f for f in os.listdir(save_dir) if f.endswith(".pt")]
+        idx = len(existing)
+        save_path = os.path.join(save_dir, f"{idx}.pt")
+        torch.save(attention_weights, save_path)
+        
+        return oup
+        
+
     def extra_repr(self) -> str:
         return f'Cq={self.embed_dim}, Ckv={self.kv_dim}, cos_attn={self.cos_attn}'
 
@@ -491,7 +578,7 @@ class CrossAttnBlock(nn.Module):
         self.checkpointing_sa_only = checkpointing_sa_only
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, return_weights=False, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.cuda.amp.autocast(enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
@@ -505,7 +592,11 @@ class CrossAttnBlock(nn.Module):
             else:
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
             x = x + self.drop_path(x_sa.mul_(gamma1))
-            x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            if return_weights:
+                dx_ca = self.ca.forward_with_weights(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            else:
+                dx_ca = self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            x = x + dx_ca
             x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         else:
             x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
@@ -514,8 +605,14 @@ class CrossAttnBlock(nn.Module):
             else:
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
             x = x + self.drop_path(x_sa.mul_(gamma1))
-            x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            
+            if return_weights:
+                dx_ca = self.ca.forward_with_weights(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            else:
+                dx_ca = self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+            x = x + dx_ca
             x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+        
         return x
     
     def extra_repr(self) -> str:
