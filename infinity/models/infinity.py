@@ -503,9 +503,12 @@ class Infinity(nn.Module):
         kv_compact = self.text_norm(kv_compact)
         sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
         kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
+        print("kv_compact shape:", kv_compact.shape, "cu_seqlens_k shape:", cu_seqlens_k.shape, "max_seqlen_k:", max_seqlen_k)
+        print("sos shape:", sos.shape, "cond_BD shape:", cond_BD.shape)
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
         last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
-
+        print("last_stage shape:", last_stage.shape)
+        
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
@@ -862,6 +865,224 @@ class Infinity(nn.Module):
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
         return ret, idx_Bld_list, img, list_summed_codes
+    
+    @torch.no_grad()
+    def autoregressive_infer_cfg_consistent(
+        self,
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT_list=None,
+        B=1, negative_label_B_or_BLT_list=None, force_gt_Bhw=None,
+        g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
+        returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
+        cfg_exp_k: float=0.0, cfg_insertion_layer=[-5],
+        vae_type=0, softmax_merge_topk=-1, ret_img=False,
+        trunk_scale=1000,
+        gt_leak=0, gt_ls_Bl=None,
+        inference_mode=False,
+        save_img_path=None,
+        sampling_per_bits=1,
+        obj_idx=0,
+    ):   # returns List[idx_Bl]
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
+        assert len(cfg_list) >= len(scale_schedule)
+        assert len(tau_list) >= len(scale_schedule)
+
+        prompt_length = len(label_B_or_BLT_list)
+        layer_count = self.num_block_chunks * self.num_blocks_in_a_chunk
+
+        # scale_schedule is used by infinity, vae_scale_schedule is used by vae if there exists a spatial patchify, 
+        # we need to convert scale_schedule to vae_scale_schedule by multiply 2 to h and w
+        if self.apply_spatial_patchify:
+            vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
+        else:
+            vae_scale_schedule = scale_schedule
+        
+        def process_prompt(label_B_or_BLT, negative_label_B_or_BLT):
+            kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
+            if any(np.array(cfg_list) != 1):
+                bs = 2*B
+                if not negative_label_B_or_BLT:
+                    kv_compact_un = kv_compact.clone()
+                    total = 0
+                    for le in lens:
+                        kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
+                        total += le
+                    kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                    cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:]+cu_seqlens_k[-1]), dim=0)
+                else:
+                    kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
+                    kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
+                    cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:]+cu_seqlens_k[-1]), dim=0)
+                    max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
+            else:
+                bs = B
+
+            kv_compact = self.text_norm(kv_compact)
+            cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
+            kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
+            ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+
+            with torch.amp.autocast('cuda', enabled=False):
+                cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+            return cond_BD_or_gss, cond_BD, ca_kv, bs
+        
+        conditions_dict = []
+
+        for i, (label_B_or_BLT, negative_label_B_or_BLT) in enumerate(zip(label_B_or_BLT_list, negative_label_B_or_BLT_list)):
+            cond_BD_or_gss, cond_BD, ca_kv, bs = process_prompt(label_B_or_BLT, negative_label_B_or_BLT)
+            conditions_dict.append({
+                'cond_BD_or_gss': cond_BD_or_gss,
+                'cond_BD': cond_BD,
+                'ca_kv': ca_kv,
+                'bs': bs,
+                'sos': cond_BD,
+                'last_stage': cond_BD.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1),
+                'summed_codes': 0
+            })
+
+        accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
+        idx_Bl_list, idx_Bld_list = [], []
+
+        if inference_mode:
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching_consistent(True, prompt_length, layer_count)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching_consistent(True, prompt_length, layer_count)
+        
+        abs_cfg_insertion_layers = []
+        add_cfg_on_logits, add_cfg_on_probs = False, False
+        leng = len(self.unregistered_blocks)
+        for item in cfg_insertion_layer:
+            if item == 0: # add cfg on logits
+                add_cfg_on_logits = True
+            elif item == 1: # add cfg on probs
+                add_cfg_on_probs = True # todo in the future, we may want to add cfg on logits and probs
+            elif item < 0: # determine to add cfg at item-th layer's output
+                assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
+                abs_cfg_insertion_layers.append(leng+item)
+            else:
+                raise ValueError(f'cfg_insertion_layer: {item} is not valid')
+        
+        num_stages_minus_1 = len(scale_schedule)-1
+
+        # list_summed_codes = []
+        for si, pn in enumerate(scale_schedule):   # si: i-th segment
+            for pi, conds in enumerate(conditions_dict):
+                # if si > 0:
+                #     list_summed_codes.append(summed_codes.clone())
+                #     print(f"summed_codes shape: {summed_codes.shape}")
+                #     print(f"idx_Bld_list shape: {len(idx_Bld_list)}")
+                
+                cfg = cfg_list[si]
+                if si >= trunk_scale:
+                    break
+                cur_L += np.array(pn).prod()
+
+                need_to_pad = 0
+                attn_fn = None
+                if self.use_flex_attn:
+                    # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
+                    # if need_to_pad:
+                    #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
+                    attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+                # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+                layer_idx = 0
+                for block_idx, b in enumerate(self.block_chunks):
+                    # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
+                    if self.add_lvl_embeding_only_first_block and block_idx == 0:
+                        conds["last_stage"] = self.add_lvl_embeding(conds["last_stage"], si, scale_schedule, need_to_pad=need_to_pad)
+                    if not self.add_lvl_embeding_only_first_block: 
+                        conds["last_stage"] = self.add_lvl_embeding(conds["last_stage"], si, scale_schedule, need_to_pad=need_to_pad)
+                    
+                    for module_idx, m in enumerate(b.module):
+                        layer_num = block_idx * len(b.module) + module_idx
+                        conds["last_stage"] = m(x=conds["last_stage"], cond_BD=conds["cond_BD_or_gss"], ca_kv=conds["ca_kv"], attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si,
+                                                is_consistent=True, prompt_index=pi, layer_num=layer_num, gamma=5.0, obj_idx=obj_idx
+                                                )
+                        if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
+                            # print(f'add cfg={cfg} on {layer_idx}-th layer output')
+                            conds["last_stage"] = cfg * conds["last_stage"][:B] + (1-cfg) * conds["last_stage"][B:]
+                            conds["last_stage"] = torch.cat((conds["last_stage"], conds["last_stage"]), 0)
+                        layer_idx += 1
+                
+                if (cfg != 1) and add_cfg_on_logits:
+                    # print(f'add cfg on add_cfg_on_logits')
+                    logits_BlV = self.get_logits(conds["last_stage"], conds["cond_BD"]).mul(1/tau_list[si])
+                    logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+                else:
+                    logits_BlV = self.get_logits(conds["last_stage"][:B], conds["cond_BD"][:B]).mul(1/tau_list[si])
+                
+                if self.use_bit_label:
+                    tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                    logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
+                    idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                    idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
+                else:
+                    idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
+                if vae_type != 0:
+                    assert returns_vemb
+                    if si < gt_leak:
+                        idx_Bld = gt_ls_Bl[si]
+                    else:
+                        assert pn[0] == 1
+                        idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d]
+                        if self.apply_spatial_patchify: # unpatchify operation
+                            idx_Bld = idx_Bld.permute(0,3,1,2) # [B, 4d, h, w]
+                            idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2) # [B, d, 2h, 2w]
+                            idx_Bld = idx_Bld.permute(0,2,3,1) # [B, 2h, 2w, d]
+                        idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
+
+                    # idx_Bld_list.append(idx_Bld)
+                    codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                    if si != num_stages_minus_1:
+                        conds["summed_codes"] += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                        conds["last_stage"] = F.interpolate(conds["summed_codes"], size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                        conds["last_stage"] = conds["last_stage"].squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
+                        if self.apply_spatial_patchify: # patchify operation
+                            conds["last_stage"] = torch.nn.functional.pixel_unshuffle(conds["last_stage"], 2) # [B, 4d, h, w]
+                        conds["last_stage"] = conds["last_stage"].reshape(*conds["last_stage"].shape[:2], -1) # [B, d, h*w] or [B, 4d, h*w]
+                        conds["last_stage"] = torch.permute(conds["last_stage"], [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
+                    else:
+                        conds["summed_codes"] += codes
+                else:
+                    if si < gt_leak:
+                        idx_Bl = gt_ls_Bl[si]
+                    h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()   # BlC
+
+                    # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
+                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
+                    ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
+                    idx_Bl_list.append(idx_Bl)
+                    if si != num_stages_minus_1:
+                        accu_BChw, last_stage = self.quant_only_used_in_inference[0].one_step_fuse(si, num_stages_minus_1+1, accu_BChw, h_BChw, scale_schedule)
+                
+                if si != num_stages_minus_1:
+                    conds["last_stage"] = self.word_embed(self.norm0_ve(conds["last_stage"]))
+                    conds["last_stage"] = conds["last_stage"].repeat(bs//B, 1, 1)
+
+        if inference_mode:
+            for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching_consistent(False, prompt_length, layer_count)
+        else:
+            assert self.num_block_chunks > 1
+            for block_chunk_ in self.block_chunks:
+                for module in block_chunk_.module.module:
+                    (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching_consistent(False, prompt_length, layer_count)
+
+        if not ret_img:
+            return ret, idx_Bl_list, []
+        
+        if vae_type != 0:
+            imgs = [vae.decode(conds["summed_codes"].squeeze(-3)) for conds in conditions_dict]
+        else:
+            img = vae.viz_from_ms_h_BChw(ret, scale_schedule=scale_schedule, same_shape=True, last_one=True)
+
+        imgs = [(img + 1) / 2 for img in imgs]
+        imgs = [img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,)) for img in imgs]
+        return imgs
     
 
 

@@ -243,6 +243,15 @@ class SelfAttention(nn.Module):
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
+
+    def kv_caching_consistent(self, enable: bool, prompt_length: int, layer_count: int): # kv caching: only used during inference
+        self.caching = enable
+        self.cached_k = [[None] * layer_count] * prompt_length
+        self.cached_v = [[None] * layer_count] * prompt_length
+        self.cached_k_total = [None] * prompt_length
+        self.cached_v_total = [None] * prompt_length
+        self.prompt_length = prompt_length
+        self.layer_count = layer_count
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
@@ -311,6 +320,91 @@ class SelfAttention(nn.Module):
         
         return self.proj_drop(self.proj(oup))
     
+    def forward_consistent(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, prompt_index=0, layer_num=0, gamma=1.0):
+        """
+        :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
+        :param (fp32) attn_bias_or_two_vector:
+                if not using_flash:
+                    a block-wise, lower-triangle matrix, like:
+                    [[[[0, -, -, -, -, -, -, -, -, -, -, -, -, -],
+                    [0, 0, 0, 0, 0, -, -, -, -, -, -, -, -, -],
+                    [0, 0, 0, 0, 0, -, -, -, -, -, -, -, -, -],
+                    [0, 0, 0, 0, 0, -, -, -, -, -, -, -, -, -],
+                    [0, 0, 0, 0, 0, -, -, -, -, -, -, -, -, -],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]]]
+                    where 0 means visible and - means invisible (-inf)
+                else:
+                    a tuple of two 1-dim int vector (VAR_visible_kvlen, VAR_invisible_qlen)
+        :return: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
+        """
+        # x: fp32
+        B, L, C = x.shape
+        
+        # qkv: amp, bf16
+        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
+        if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
+        else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
+        
+        if self.cos_attn:   # always True
+            scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp() # 11H1 (flash), or 1H11 (not flash)
+            q = F.normalize(q, dim=-1, eps=1e-12).mul(scale_mul).contiguous()   # fp32
+            k = F.normalize(k, dim=-1, eps=1e-12).contiguous()                  # fp32
+            v = v.contiguous()                                                  # bf16
+        else:   # be contiguous, to make kernel happy
+            q = q.contiguous()      # bf16
+            k = k.contiguous()      # bf16
+            v = v.contiguous()      # bf16
+        if rope2d_freqs_grid is not None:
+            q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
+        if self.caching:    # kv caching: only used during inference
+            if self.cached_k_total[prompt_index] is None:
+                self.cached_k_total[prompt_index] = k
+                self.cached_k[prompt_index][layer_num] = k
+                self.cached_v_total[prompt_index] = v
+                self.cached_v[prompt_index][layer_num] = v
+            else: 
+                self.cached_k_total[prompt_index] = torch.cat((self.cached_k_total[prompt_index], k), dim=L_dim)
+                self.cached_v_total[prompt_index] = torch.cat((self.cached_v_total[prompt_index], v), dim=L_dim)
+                self.cached_k[prompt_index][layer_num] = k
+                self.cached_v[prompt_index][layer_num] = v
+                k = self.cached_k_total[prompt_index]
+                v = self.cached_v_total[prompt_index]
+                
+                if layer_num < 0.28 * self.layer_count:
+                    for pi in range(len(self.cached_k)):
+                        if pi == prompt_index:
+                            continue
+                        k = torch.cat((k, self.cached_k_total[pi]), dim=L_dim)
+                        v = torch.cat((v, self.cached_v_total[pi]), dim=L_dim)
+                        break
+        
+        if self.using_flash:
+            if attn_bias_or_two_vector is not None: # training
+                kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
+            else:                                   # inference (autoregressive sampling)
+                kw = dict()
+            oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale, **kw).view(B, L, C)
+        else:
+            # if self.cos_attn: q, k are in fp32; v is in bf16
+            # else: q, k, v are in bf16
+            if self.use_flex_attn and attn_fn is not None:
+                oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
+            else:
+                oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
+            # oup: bf16
+        
+        return self.proj_drop(self.proj(oup))
+    
+
     def extra_repr(self) -> str:
         tail = ''
         return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
@@ -578,7 +672,7 @@ class CrossAttnBlock(nn.Module):
         self.checkpointing_sa_only = checkpointing_sa_only
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, return_weights=False, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, return_weights=False, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, is_consistent=False, prompt_index=0, layer_num=0, gamma=1.0, obj_idx=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.cuda.amp.autocast(enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
@@ -590,7 +684,10 @@ class CrossAttnBlock(nn.Module):
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
+                if is_consistent:
+                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, prompt_index=prompt_index, layer_num=layer_num, gamma=gamma)
+                else:
+                    x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             if return_weights:
                 dx_ca = self.ca.forward_with_weights(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
@@ -603,7 +700,10 @@ class CrossAttnBlock(nn.Module):
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
+                if is_consistent:
+                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, prompt_index=prompt_index, layer_num=layer_num, gamma=gamma)
+                else:
+                    x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             
             if return_weights:
