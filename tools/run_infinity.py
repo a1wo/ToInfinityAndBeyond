@@ -97,6 +97,7 @@ def gen_one_img(
     g_seed=None,
     sampling_per_bits=1,
     enable_positive_prompt=0,
+    return_weights=False,
 ):
     sstt = time.time()
     if not isinstance(cfg_list, list):
@@ -111,7 +112,7 @@ def gen_one_img(
     print(f'cfg: {cfg_list}, tau: {tau_list}')
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
         stt = time.time()
-        _, _, img_list = infinity_test.autoregressive_infer_cfg(
+        ret, idx_Bld_list, img_list = infinity_test.autoregressive_infer_cfg(
             vae=vae,
             scale_schedule=scale_schedule,
             label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
@@ -123,10 +124,11 @@ def gen_one_img(
             ret_img=True, trunk_scale=1000,
             gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
             sampling_per_bits=sampling_per_bits,
+            return_weights = return_weights,
         )
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
-    return img
+    return img #, idx_Bld_list
 
 
 def gen_one_img_2(
@@ -300,7 +302,7 @@ def gen_one_img_consistent(
     print(f'cfg: {cfg_list}, tau: {tau_list}')
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
         stt = time.time()
-        imgs = infinity_test.autoregressive_infer_cfg_consistent(
+        imgs, attention_masks = infinity_test.autoregressive_infer_cfg_consistent(
             vae=vae,
             scale_schedule=scale_schedule,
             label_B_or_BLT_list=label_B_or_BLT_list, g_seed=g_seed,
@@ -315,7 +317,7 @@ def gen_one_img_consistent(
             obj_idx=obj_idx,
         )
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
-    return [img.squeeze() for img in imgs]
+    return [img.squeeze() for img in imgs], attention_masks
 
 
 def get_prompt_id(prompt):

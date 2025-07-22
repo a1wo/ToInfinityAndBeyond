@@ -250,6 +250,8 @@ class SelfAttention(nn.Module):
         self.cached_v = [[None] * layer_count] * prompt_length
         self.cached_k_total = [None] * prompt_length
         self.cached_v_total = [None] * prompt_length
+        self.cached_k_total_first = None
+        self.cached_v_total_first = None
         self.prompt_length = prompt_length
         self.layer_count = layer_count
     
@@ -320,7 +322,7 @@ class SelfAttention(nn.Module):
         
         return self.proj_drop(self.proj(oup))
     
-    def forward_consistent(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, prompt_index=0, layer_num=0, gamma=1.0):
+    def forward_consistent(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, prompt_index=0, scale_index=0, gamma=1.0, attention_masks=None):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -368,24 +370,66 @@ class SelfAttention(nn.Module):
         if self.caching:    # kv caching: only used during inference
             if self.cached_k_total[prompt_index] is None:
                 self.cached_k_total[prompt_index] = k
-                self.cached_k[prompt_index][layer_num] = k
+                self.cached_k[prompt_index][scale_index] = k
                 self.cached_v_total[prompt_index] = v
-                self.cached_v[prompt_index][layer_num] = v
+                self.cached_v[prompt_index][scale_index] = v
+                self.cached_k_total_first = k
+                self.cached_v_total_first = v
             else: 
                 self.cached_k_total[prompt_index] = torch.cat((self.cached_k_total[prompt_index], k), dim=L_dim)
                 self.cached_v_total[prompt_index] = torch.cat((self.cached_v_total[prompt_index], v), dim=L_dim)
-                self.cached_k[prompt_index][layer_num] = k
-                self.cached_v[prompt_index][layer_num] = v
+                self.cached_k[prompt_index][scale_index] = k
+                self.cached_v[prompt_index][scale_index] = v
+                if prompt_index == 0 and (scale_index < 0.2 * self.layer_count or scale_index % 5 == 0):
+                    self.cached_k_total_first = torch.cat((self.cached_k_total_first, k), dim=L_dim)
+                    self.cached_v_total_first = torch.cat((self.cached_v_total_first, v), dim=L_dim)
+                
                 k = self.cached_k_total[prompt_index]
                 v = self.cached_v_total[prompt_index]
-                
-                if layer_num < 0.28 * self.layer_count:
-                    for pi in range(len(self.cached_k)):
-                        if pi == prompt_index:
-                            continue
-                        k = torch.cat((k, self.cached_k_total[pi]), dim=L_dim)
-                        v = torch.cat((v, self.cached_v_total[pi]), dim=L_dim)
-                        break
+
+                # if scale_index < 0.28 * self.layer_count:
+                #     for pi in range(len(self.cached_k)):
+                #         if pi == prompt_index:
+                #             continue
+                #         k = torch.cat((k, self.cached_k_total[pi]), dim=L_dim)
+                #         v = torch.cat((v, self.cached_v_total[pi]), dim=L_dim)
+                #         break
+
+                if attention_masks is not None and prompt_index != 0:
+                    print(f"scale_index: {scale_index}/{self.layer_count}, prompt_index: {prompt_index} ,len cached_k_total: {len(self.cached_k_total)}")
+                    # for si in range
+                    # cached_k = None
+                    # cached_v = None
+                    mask = None
+                    for si in range(scale_index + 1):
+                        for pi in [0]: # range(len(self.cached_k)):
+                    #         print(f"pi: {pi}, si: {si}")
+                    #         print(f"self.cached_k[pi][si] shape: {self.cached_k[pi][si].shape}")
+                    #         if cached_k is None:
+                    #             cached_k = self.cached_k[pi][si]
+                    #             cached_v = self.cached_v[pi][si]
+                            if mask is None:
+                                mask = attention_masks[pi][si].bool()
+                            else:
+                                mask = torch.cat((mask, attention_masks[pi][si].bool()), dim=0)
+                    #         # print(f"cached_k.shape: {cached_k.shape}, mask.shape: {mask.shape}")
+                    #         # print(f"type mask: {mask.dtype}")
+                    #         # masked_k = cached_k[:,:,mask,:]
+                    #         else:
+                    #             cached_k = torch.cat((cached_k, self.cached_k[pi][si]), dim=L_dim)
+                    #             cached_v = torch.cat((cached_v, self.cached_v[pi][si]), dim=L_dim)
+                    #         # masked_v = cached_v[:,:,mask,:]
+                    # k = torch.cat((k, cached_k), dim=L_dim)
+                    # v = torch.cat((v, cached_v), dim=L_dim)
+                    print(f"mask shape: {mask.shape}, k shape: {k.shape}, v shape: {v.shape}")
+                    k = torch.cat((k, self.cached_k_total[0][:,:,mask,:]), dim=L_dim)
+                    v = torch.cat((v, self.cached_v_total[0][:,:,mask,:]), dim=L_dim)
+
+                # if scale_index < 0.5 * self.layer_count:
+                #     if prompt_index != 0:
+                #         k = torch.cat((k, self.cached_k_total_first), dim=L_dim)
+                #         v = torch.cat((v, self.cached_v_total_first), dim=L_dim)
+
         
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
@@ -450,6 +494,8 @@ class CrossAttention(nn.Module):
         
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = get_dropout_layer(proj_drop)
+
+        self.last_attention_weight = None
     
     def forward(self, q, ca_kv):
         """
@@ -532,6 +578,8 @@ class CrossAttention(nn.Module):
         attention_weights = []
         outputs = []
         
+
+        returned_weights = None
         for batch_idx in range(B):
             # Get text tokens (K, V) for this batch
             start_idx = cu_seqlens_k[batch_idx]
@@ -553,13 +601,14 @@ class CrossAttention(nn.Module):
             # Apply softmax to get attention weights
             attn_weights = F.softmax(attn_scores, dim=-1)  # (Lq, num_heads, seq_len_k)
             
-            # Store attention weights for this batch
-            attention_weights.append({
-                'weights': attn_weights,  # (Lq, num_heads, seq_len_k)
-                'seq_len_k': seq_len_k,
-                'batch_idx': batch_idx
-            })
-            
+            # # Store attention weights for this batch
+            # attention_weights.append({
+            #     'weights': attn_weights,  # (Lq, num_heads, seq_len_k)
+            #     'seq_len_k': seq_len_k,
+            #     'batch_idx': batch_idx
+            # })
+            if returned_weights is None:
+                returned_weights = attn_weights
             # Apply attention to values: Attention @ V
             output = torch.einsum('qhk,khd->qhd', attn_weights, v_batch)  # (Lq, num_heads, head_dim)
             outputs.append(output)
@@ -571,13 +620,13 @@ class CrossAttention(nn.Module):
         oup = self.proj_drop(self.proj(oup))
         
         # Save attention weights to a folder with a serial index
-        save_dir = "cache" + "/" + "attention_weights"
-        os.makedirs(save_dir, exist_ok=True)
-        existing = [f for f in os.listdir(save_dir) if f.endswith(".pt")]
-        idx = len(existing)
-        save_path = os.path.join(save_dir, f"{idx}.pt")
-        torch.save(attention_weights, save_path)
-        
+        # save_dir = "cache" + "/" + "attention_weights"
+        # os.makedirs(save_dir, exist_ok=True)
+        # existing = [f for f in os.listdir(save_dir) if f.endswith(".pt")]
+        # idx = len(existing)
+        # save_path = os.path.join(save_dir, f"{idx}.pt")
+        # torch.save(attention_weights, save_path)
+        self.last_attention_weight = returned_weights
         return oup
         
 
@@ -670,9 +719,11 @@ class CrossAttnBlock(nn.Module):
             self.ca_gamma = 1
         
         self.checkpointing_sa_only = checkpointing_sa_only
+
+        self.ca_weights = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, return_weights=False, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, is_consistent=False, prompt_index=0, layer_num=0, gamma=1.0, obj_idx=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, return_weights=False, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, is_consistent=False, prompt_index=0, scale_index=0, gamma=1.0, obj_idx=0, attention_masks=None):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.cuda.amp.autocast(enabled=False):    # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
@@ -685,12 +736,13 @@ class CrossAttnBlock(nn.Module):
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
                 if is_consistent:
-                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, prompt_index=prompt_index, layer_num=layer_num, gamma=gamma)
+                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, prompt_index=prompt_index, scale_index=scale_index, gamma=gamma, attention_masks=attention_masks)
                 else:
                     x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             if return_weights:
                 dx_ca = self.ca.forward_with_weights(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+                self.ca_weights = self.ca.last_attention_weight
             else:
                 dx_ca = self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + dx_ca
@@ -701,13 +753,14 @@ class CrossAttnBlock(nn.Module):
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
                 if is_consistent:
-                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, prompt_index=prompt_index, layer_num=layer_num, gamma=gamma)
+                    x_sa = self.sa.forward_consistent(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, prompt_index=prompt_index, scale_index=scale_index, gamma=gamma, attention_masks=attention_masks)
                 else:
                     x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             
             if return_weights:
                 dx_ca = self.ca.forward_with_weights(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
+                self.ca_weights = self.ca.last_attention_weight
             else:
                 dx_ca = self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + dx_ca

@@ -468,6 +468,7 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
+        return_weights=False,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -567,7 +568,7 @@ class Infinity(nn.Module):
                 for m in b.module:
                     # GENERATE ATTENTION WEIGHTS
                     # last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
-                    last_stage = m(return_weights=False, x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    last_stage = m(return_weights=return_weights, x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
@@ -638,7 +639,7 @@ class Infinity(nn.Module):
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
 
         if not ret_img:
-            return ret, idx_Bl_list, []
+            return ret, idx_Bld_list, []
         
         if vae_type != 0:
             img = vae.decode(summed_codes.squeeze(-3))
@@ -647,7 +648,7 @@ class Infinity(nn.Module):
 
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
-        return ret, idx_Bl_list, img
+        return ret, idx_Bld_list, img
     
 
     @torch.no_grad()
@@ -890,7 +891,7 @@ class Infinity(nn.Module):
         assert len(tau_list) >= len(scale_schedule)
 
         prompt_length = len(label_B_or_BLT_list)
-        layer_count = self.num_block_chunks * self.num_blocks_in_a_chunk
+        layer_count = len(scale_schedule) # self.num_block_chunks * self.num_blocks_in_a_chunk
 
         # scale_schedule is used by infinity, vae_scale_schedule is used by vae if there exists a spatial patchify, 
         # we need to convert scale_schedule to vae_scale_schedule by multiply 2 to h and w
@@ -899,6 +900,15 @@ class Infinity(nn.Module):
         else:
             vae_scale_schedule = scale_schedule
         
+
+        def create_mask_topk(att_resized, k=100):
+            att_flat = att_resized.view(-1)  # Flatten the attention map
+            top_k_values, top_k_indices = torch.topk(att_flat, k)
+            mask = torch.zeros_like(att_flat)
+            mask[top_k_indices] = 1.0
+            mask = mask.view(att_resized.shape)  # Reshape back to original shape
+            return mask
+
         def process_prompt(label_B_or_BLT, negative_label_B_or_BLT):
             kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
             if any(np.array(cfg_list) != 1):
@@ -970,6 +980,7 @@ class Infinity(nn.Module):
         num_stages_minus_1 = len(scale_schedule)-1
 
         # list_summed_codes = []
+        attention_masks = [[] for pi in range(len(conditions_dict)) ]
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
             for pi, conds in enumerate(conditions_dict):
                 # if si > 0:
@@ -991,6 +1002,7 @@ class Infinity(nn.Module):
                     attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
                 # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
                 layer_idx = 0
+                ca_weights_list = []
                 for block_idx, b in enumerate(self.block_chunks):
                     # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
                     if self.add_lvl_embeding_only_first_block and block_idx == 0:
@@ -999,15 +1011,22 @@ class Infinity(nn.Module):
                         conds["last_stage"] = self.add_lvl_embeding(conds["last_stage"], si, scale_schedule, need_to_pad=need_to_pad)
                     
                     for module_idx, m in enumerate(b.module):
-                        layer_num = block_idx * len(b.module) + module_idx
                         conds["last_stage"] = m(x=conds["last_stage"], cond_BD=conds["cond_BD_or_gss"], ca_kv=conds["ca_kv"], attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si,
-                                                is_consistent=True, prompt_index=pi, layer_num=layer_num, gamma=5.0, obj_idx=obj_idx
+                                                is_consistent=True, prompt_index=pi, scale_index=si, gamma=5.0, obj_idx=obj_idx, return_weights=True, attention_masks=attention_masks
                                                 )
+                        ca_weights_list.append(m.ca_weights.cpu().numpy())
                         if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                             # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                             conds["last_stage"] = cfg * conds["last_stage"][:B] + (1-cfg) * conds["last_stage"][B:]
                             conds["last_stage"] = torch.cat((conds["last_stage"], conds["last_stage"]), 0)
                         layer_idx += 1
+                avg_map = np.mean(ca_weights_list, axis=0)
+                # avg_map = avg_map.reshape(pn[1], pn[2], avg_map.shape[1], avg_map.shape[2])
+                avg_map = np.mean(avg_map, axis=1) # average over heads
+                avg_map = avg_map[:, obj_idx] 
+                avg_map = torch.from_numpy(avg_map).to(conds["last_stage"].device)
+                mask = 1 - create_mask_topk(avg_map, 1 + avg_map.numel() // 4)
+                attention_masks[pi].append(mask)
                 
                 if (cfg != 1) and add_cfg_on_logits:
                     # print(f'add cfg on add_cfg_on_logits')
@@ -1082,7 +1101,7 @@ class Infinity(nn.Module):
 
         imgs = [(img + 1) / 2 for img in imgs]
         imgs = [img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,)) for img in imgs]
-        return imgs
+        return imgs, attention_masks
     
 
 
