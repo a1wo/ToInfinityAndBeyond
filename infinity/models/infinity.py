@@ -883,7 +883,7 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
-        obj_idx=0,
+        obj_idxes=None,
     ):   # returns List[idx_Bl]
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -983,6 +983,7 @@ class Infinity(nn.Module):
         attention_masks = [[] for pi in range(len(conditions_dict)) ]
         for si, pn in enumerate(scale_schedule):   # si: i-th segment
             for pi, conds in enumerate(conditions_dict):
+                print(f"Processing scale {si+1}/{len(scale_schedule)} for prompt {pi+1}/{len(conditions_dict)}")
                 # if si > 0:
                 #     list_summed_codes.append(summed_codes.clone())
                 #     print(f"summed_codes shape: {summed_codes.shape}")
@@ -1012,7 +1013,7 @@ class Infinity(nn.Module):
                     
                     for module_idx, m in enumerate(b.module):
                         conds["last_stage"] = m(x=conds["last_stage"], cond_BD=conds["cond_BD_or_gss"], ca_kv=conds["ca_kv"], attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si,
-                                                is_consistent=True, prompt_index=pi, scale_index=si, gamma=5.0, obj_idx=obj_idx, return_weights=True, attention_masks=attention_masks
+                                                is_consistent=True, prompt_index=pi, scale_index=si, gamma=5.0, obj_idx=obj_idxes, return_weights=True, attention_masks=attention_masks
                                                 )
                         ca_weights_list.append(m.ca_weights.cpu().numpy())
                         if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
@@ -1023,9 +1024,9 @@ class Infinity(nn.Module):
                 avg_map = np.mean(ca_weights_list, axis=0)
                 # avg_map = avg_map.reshape(pn[1], pn[2], avg_map.shape[1], avg_map.shape[2])
                 avg_map = np.mean(avg_map, axis=1) # average over heads
-                avg_map = avg_map[:, obj_idx] 
+                avg_map = avg_map[:, obj_idxes[pi]] 
                 avg_map = torch.from_numpy(avg_map).to(conds["last_stage"].device)
-                mask = 1 - create_mask_topk(avg_map, 1 + avg_map.numel() // 4)
+                mask = create_mask_topk(avg_map, 1 + avg_map.numel() // 4)
                 attention_masks[pi].append(mask)
                 
                 if (cfg != 1) and add_cfg_on_logits:

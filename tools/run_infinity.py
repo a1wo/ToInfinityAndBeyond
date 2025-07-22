@@ -267,7 +267,7 @@ def gen_one_img_consistent(
     text_encoder,
     prompt_list, 
     x_s,
-    obj_idx,
+    obj_idxes,
     cfg_list=[],
     tau_list=[],
     negative_prompt='',
@@ -314,7 +314,7 @@ def gen_one_img_consistent(
             ret_img=True, trunk_scale=1000,
             gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
             sampling_per_bits=sampling_per_bits,
-            obj_idx=obj_idx,
+            obj_idxes=obj_idxes,
         )
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     return [img.squeeze() for img in imgs], attention_masks

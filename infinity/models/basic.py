@@ -395,14 +395,22 @@ class SelfAttention(nn.Module):
                 #         v = torch.cat((v, self.cached_v_total[pi]), dim=L_dim)
                 #         break
 
-                if attention_masks is not None and prompt_index != 0:
-                    print(f"scale_index: {scale_index}/{self.layer_count}, prompt_index: {prompt_index} ,len cached_k_total: {len(self.cached_k_total)}")
+                if attention_masks is not None and prompt_index != 0 and scale_index < 0.4 * self.layer_count and scale_index > 0.1 * self.layer_count:
+                    print(f"scale_index: {scale_index}/{self.layer_count}, prompt_index: {prompt_index} ,len cached_k_total: {len(self.cached_k[0])}")
                     # for si in range
                     # cached_k = None
                     # cached_v = None
-                    mask = None
-                    for si in range(scale_index + 1):
-                        for pi in [0]: # range(len(self.cached_k)):
+                    for pi in [0]: #range(len(self.cached_k)):
+                        if pi == prompt_index:
+                            continue
+                        mask = None
+                        if pi < prompt_index:
+                            scale_count = scale_index + 1
+                        else:
+                            scale_count = scale_index 
+                        for si in range(scale_count):
+                        # if np.random.rand() < scale_index / self.layer_count:
+                        #     continue
                     #         print(f"pi: {pi}, si: {si}")
                     #         print(f"self.cached_k[pi][si] shape: {self.cached_k[pi][si].shape}")
                     #         if cached_k is None:
@@ -421,9 +429,9 @@ class SelfAttention(nn.Module):
                     #         # masked_v = cached_v[:,:,mask,:]
                     # k = torch.cat((k, cached_k), dim=L_dim)
                     # v = torch.cat((v, cached_v), dim=L_dim)
-                    print(f"mask shape: {mask.shape}, k shape: {k.shape}, v shape: {v.shape}")
-                    k = torch.cat((k, self.cached_k_total[0][:,:,mask,:]), dim=L_dim)
-                    v = torch.cat((v, self.cached_v_total[0][:,:,mask,:]), dim=L_dim)
+                        # print(f"mask shape: {mask.shape}, k shape: {k.shape}, v shape: {v.shape}")
+                        k = torch.cat((k, self.cached_k_total[pi][:,:,mask,:]), dim=L_dim)
+                        v = torch.cat((v, self.cached_v_total[pi][:,:,mask,:]), dim=L_dim)
 
                 # if scale_index < 0.5 * self.layer_count:
                 #     if prompt_index != 0:
